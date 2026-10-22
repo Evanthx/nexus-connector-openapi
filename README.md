@@ -2,7 +2,7 @@
 
 This repo turns an OpenAPI spec into a Nexus service with no hand-written HTTP code. Each
 operation in the spec becomes a typed Nexus operation backed by one standalone activity. The
-activity sends its request through the [HTTP connector](../nexus-connector-http) used as a
+activity sends its request through the [HTTP connector](https://github.com/Evanthx/nexus-connector-http) used as a
 library, which provides retries, rate limiting and secret redaction. nexgen generates typed
 callers for the service in Go, Java, Python and TypeScript.
 
@@ -99,6 +99,15 @@ compensation step. An activity can't durably run other activities and wait for t
 can.
 
 ## Commands
+
+This repo builds against a local copy of the HTTP connector (a `replace` in `go.mod`), so clone
+both repos side by side:
+
+```bash
+git clone https://github.com/Evanthx/nexus-connector-http
+git clone https://github.com/Evanthx/nexus-connector-openapi
+cd nexus-connector-openapi
+```
 
 ```bash
 make generate   # run openapi2nexus and nexgen (Go) for both APIs
