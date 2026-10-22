@@ -1,0 +1,22 @@
+# What openapi2nexus needs to know about the Forecast Reports API that its spec doesn't say.
+spec: forecastreports.yaml
+service: ForecastReportService
+
+# Operations written by hand, which call several of the API's operations.
+operations:
+  runReport:
+    fqn: runReport
+    description: >-
+      Start a report and return it once it is done. One activity, which starts the report and
+      checks it in a loop until it is done or failed.
+    input:
+      $ref: "#/$defs/NewReport"
+    output:
+      $ref: "#/$defs/Report"
+
+output:
+  nexusrpc: forecastreports.nexusrpc.yaml
+  go: operations.gen.go
+  goPackage: forecastreports
+  typesImport: github.com/temporalio/nexus-connector-openapi/apis/forecastreports/reportsapi
+  typesPackage: reportsapi

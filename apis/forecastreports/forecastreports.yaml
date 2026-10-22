@@ -1,0 +1,99 @@
+# A made-up API, for showing an operation that starts a job and polls for its result in one
+# activity. Many real APIs work this way (reports, exports, transcription). The end-to-end test
+# serves it with httptest.
+openapi: 3.0.3
+info:
+  title: Forecast Reports
+  version: "1"
+servers:
+  - url: https://reports.example.com/v1
+paths:
+  /reports:
+    post:
+      operationId: createReport
+      summary: Start building a forecast report.
+      description: >-
+        Starts a report and returns it, usually still pending. A request with an Idempotency-Key
+        that was used before returns the report that key started, and starts nothing.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewReport"
+      responses:
+        "202":
+          description: The report, usually still pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Report"
+        "400":
+          description: The request is invalid.
+  /reports/{id}:
+    get:
+      operationId: getReport
+      summary: Get a report and its status.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Report"
+        "404":
+          description: No such report.
+components:
+  schemas:
+    NewReport:
+      type: object
+      properties:
+        zip:
+          type: string
+          description: US zip code.
+        days:
+          type: integer
+          minimum: 1
+          maximum: 10
+      required: [zip, days]
+    Report:
+      type: object
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+          enum: [pending, done, failed]
+        forecast:
+          type: array
+          items:
+            $ref: "#/components/schemas/ForecastDay"
+        error:
+          type: string
+          nullable: true
+          description: Why the report failed.
+      required: [id, status]
+    ForecastDay:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        highF:
+          type: number
+        lowF:
+          type: number
+        summary:
+          type: string
