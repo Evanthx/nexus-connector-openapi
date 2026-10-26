@@ -11,10 +11,15 @@ It is a proof of concept: it reads only what its two example specs need (see
 
 1. [**One operation per call**](#1-one-operation-per-call), generated from the spec. Each Nexus
    operation is one standalone activity making one HTTP request.
-2. [**Several calls in one activity**](#2-several-calls-in-one-activity-start-then-poll): an
-   operation that starts a job and polls for its result in a loop, within one activity attempt.
-3. [**Several calls in a workflow**](#3-several-calls-in-a-workflow): an operation backed by a
-   workflow that runs the generated activities, for calls that can't be repeated as one unit.
+2. [**Several calls in one activity**](#2-several-calls-in-one-activity-start-then-poll): the
+   connector exposes a single endpoint, one Nexus operation, that wraps several HTTP calls. The
+   calling workflow makes **one** Nexus call and gets back the finished result. All the HTTP
+   calls happen inside the connector: its activity starts a job, then polls in a loop until the
+   job is done, within one activity attempt.
+3. [**Several calls in a workflow**](#3-several-calls-in-a-workflow): the connector again
+   exposes a single endpoint that wraps several HTTP calls, but backs it with a workflow instead
+   of a standalone activity. The workflow runs each call as its own activity, for more complex
+   flows that can't run every call in one activity.
 
 ## How it works
 
@@ -90,7 +95,8 @@ long as it:
 ### 3. Several calls in a workflow
 
 `WeatherService.weatherForZips` (`apis/weather/weather.go`) is a Nexus operation backed by a
-**workflow**. The workflow runs the generated `GetWeatherByZip` activity for each zip code at
+**workflow** that runs inside the connector. The caller makes one Nexus call with a list of zip
+codes. The connector's workflow runs the generated `GetWeatherByZip` activity for each zip code at
 once, and returns all the results or the first failure.
 
 Use a workflow when the calls aren't one idempotent unit that can be repeated from the top. For
