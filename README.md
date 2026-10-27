@@ -7,7 +7,9 @@ library, which provides retries, rate limiting and secret redaction. nexgen gene
 callers for the service in Go, Java, Python and TypeScript.
 
 It is a proof of concept: it reads only what its two example specs need (see
-[Limits](#limits)). It shows three ways to expose an API's calls over Nexus:
+[Limits](#limits)). It shows three ways to expose an API's calls over Nexus. The first is
+generated entirely from the spec. The other two build on the generated code for more advanced
+behavior, and need some Go written by hand, though still no HTTP code:
 
 1. [**One operation per call**](#1-one-operation-per-call), generated from the spec. Each Nexus
    operation is one standalone activity making one HTTP request.
