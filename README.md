@@ -45,9 +45,10 @@ connector.yaml ─┴─► openapi2nexus ─┬─► weather.nexusrpc.yaml ─
   - `Call` turns a typed input into the HTTP connector's `SendRequestInput`, calls `SendRequest`,
     and decodes the body into the typed output.
   - `ActivityOperation` is the Nexus operation that starts the activity. It first rejects a
-    request that can't be made, or that outlasts the caller's timeout.
+    request that can't be made, or whose caller's timeout is too short for one request plus 10
+    seconds.
 
-The deployment decides each API's base URL, API key variable and timeout in
+The deployment decides each API's base URL, API key variable and maximum duration in
 `openapiconnector.Config`. Callers can't change them.
 
 ## The examples
@@ -69,8 +70,11 @@ HTTP request.
 it once it is done, in **one standalone activity** that polls in a loop within one attempt. It
 calls the generated `CreateReport` and `GetReport` as plain functions, not as activities.
 
-**Timeouts.** A plain activity's attempt is one HTTP request, limited to 60 seconds; the whole
-operation, every attempt and wait, is limited by `ScheduleToCloseSeconds` (25 hours by default).
+**Timeouts.** A plain activity's attempt is one HTTP request, limited to 60 seconds. The whole
+operation, every attempt and wait, ends 10 seconds before the caller's Nexus operation times out,
+so the caller gets the last error rather than a timeout (`Connector.ScheduleToClose`). It never
+runs longer than `MaxDurationSeconds`, or the HTTP connector's `HTTP_CONNECTOR_MAX_DURATION_MINUTES`
+(25 hours by default), whichever is shorter; with no caller timeout, that maximum applies.
 A polling attempt can last the whole operation instead. `PollingOperation` starts it with
 `PollingActivityOptions`: its `StartToCloseTimeout` is the operation's `ScheduleToCloseTimeout`,
 and a `HeartbeatTimeout` notices a worker that died. `WaitToPoll` heartbeats before each wait, so
@@ -100,6 +104,11 @@ long as it:
 **workflow** that runs inside the connector. The caller makes one Nexus call with a list of zip
 codes. The connector's workflow runs the generated `GetWeatherByZip` activity for each zip code at
 once, and returns all the results or the first failure.
+
+It is bounded the same way as the activity-backed operations: its start refuses a caller timeout
+too short for one request, the workflow's execution timeout is the operation's duration plus 5
+seconds, and its activities stop at the operation's duration, so their last error reaches the
+caller before the workflow or the caller times out.
 
 Use a workflow when the calls aren't one idempotent unit that can be repeated from the top. For
 example: steps that depend on earlier results, a wait longer than a retry should cover, or a

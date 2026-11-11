@@ -41,9 +41,13 @@ const (
 	interzoidKeyVar = httpconnector.SecretEnvPrefix + "INTERZOID"
 	interzoidKey    = "test-license"
 
-	// connectorTimeout is each operation's ScheduleToCloseSeconds; callers wait longer.
-	connectorTimeout = 60
+	// connectorTimeout is each API's MaxDurationSeconds. It is longer than the callers' timeouts,
+	// so only a caller's timeout can stop a call's retries early.
+	connectorTimeout = 300
 	callerTimeout    = 2 * time.Minute
+	// shortCallerTimeout leaves the connector 45s - 10s = 35s, under connectorTimeout: enough for
+	// one request's default 30s, which the connector requires.
+	shortCallerTimeout = 45 * time.Second
 	// pollInterval differs from the retry policy's backoff (1s, then 2s), so the test can tell
 	// which one spaced the polls.
 	pollInterval = 3 * time.Second
@@ -67,6 +71,20 @@ func callWeatherForZips(ctx workflow.Context, in weatherapi.WeatherForZipsInput)
 	return out, err
 }
 
+// callGetWeatherByZipWithin and callWeatherForZipsWithin are callGetWeatherByZip and
+// callWeatherForZips with the given Nexus operation timeout.
+func callGetWeatherByZipWithin(ctx workflow.Context, in weatherapi.GetWeatherByZipInput, timeout time.Duration) error {
+	return workflow.NewNexusClient(endpointName, weatherapi.WeatherService.ServiceName).
+		ExecuteOperation(ctx, weatherapi.WeatherService.GetWeatherByZip, in, workflow.NexusOperationOptions{ScheduleToCloseTimeout: timeout}).
+		Get(ctx, nil)
+}
+
+func callWeatherForZipsWithin(ctx workflow.Context, in weatherapi.WeatherForZipsInput, timeout time.Duration) error {
+	return workflow.NewNexusClient(endpointName, weatherapi.WeatherService.ServiceName).
+		ExecuteOperation(ctx, weatherapi.WeatherService.WeatherForZips, in, workflow.NexusOperationOptions{ScheduleToCloseTimeout: timeout}).
+		Get(ctx, nil)
+}
+
 func callGetReport(ctx workflow.Context, in reportsapi.GetReportInput) (reportsapi.Report, error) {
 	var out reportsapi.Report
 	err := workflow.NewNexusClient(endpointName, reportsapi.ForecastReportService.ServiceName).
@@ -83,7 +101,8 @@ func callRunReport(ctx workflow.Context, in reportsapi.NewReport) (reportsapi.Re
 	return out, err
 }
 
-// interzoid is a fake of Interzoid's weather API. Zip 00000 doesn't exist.
+// interzoid is a fake of Interzoid's weather API. Zip 00000 doesn't exist; zip 50399 always
+// answers 503.
 type interzoid struct {
 	mu   sync.Mutex
 	reqs []*http.Request
@@ -100,6 +119,8 @@ func (s *interzoid) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid license API key", http.StatusForbidden)
 	case r.URL.Query().Get("zip") == "00000":
 		http.Error(w, "zip code not found", http.StatusNotFound)
+	case r.URL.Query().Get("zip") == "50399":
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 	default:
 		zip := r.URL.Query().Get("zip")
 		// Extra isn't in the spec, as real APIs often add fields; the output keeps it.
@@ -254,13 +275,13 @@ func TestEndToEnd(t *testing.T) {
 	require.NoError(t, err)
 	connectorWorker := worker.New(connectorClient, connectorTaskQueue, worker.Options{})
 	weather.Register(connectorWorker, openapiconnector.New(weather.API, openapiconnector.Config{
-		BaseURL:                weatherSrv.URL,
-		APIKeyEnvVar:           interzoidKeyVar,
-		ScheduleToCloseSeconds: connectorTimeout,
+		BaseURL:            weatherSrv.URL,
+		APIKeyEnvVar:       interzoidKeyVar,
+		MaxDurationSeconds: connectorTimeout,
 	}, httpActivities))
 	forecastreports.Register(connectorWorker, openapiconnector.New(forecastreports.API, openapiconnector.Config{
-		BaseURL:                reportsSrv.URL,
-		ScheduleToCloseSeconds: connectorTimeout,
+		BaseURL:            reportsSrv.URL,
+		MaxDurationSeconds: connectorTimeout,
 	}, httpActivities), pollInterval)
 	require.NoError(t, connectorWorker.Start())
 	t.Cleanup(connectorWorker.Stop)
@@ -271,6 +292,8 @@ func TestEndToEnd(t *testing.T) {
 	callerWorker := worker.New(callerClient, callerTaskQueue, worker.Options{})
 	callerWorker.RegisterWorkflow(callGetWeatherByZip)
 	callerWorker.RegisterWorkflow(callWeatherForZips)
+	callerWorker.RegisterWorkflow(callGetWeatherByZipWithin)
+	callerWorker.RegisterWorkflow(callWeatherForZipsWithin)
 	callerWorker.RegisterWorkflow(callGetReport)
 	callerWorker.RegisterWorkflow(callRunReport)
 	require.NoError(t, callerWorker.Start())
@@ -281,6 +304,45 @@ func TestEndToEnd(t *testing.T) {
 		r, err := callerClient.ExecuteWorkflow(ctx, client.StartWorkflowOptions{TaskQueue: callerTaskQueue}, wf, in)
 		require.NoError(t, err)
 		return r.Get(ctx, out)
+	}
+	runWithin := func(t *testing.T, wf, in any, timeout time.Duration) error {
+		t.Helper()
+		r, err := callerClient.ExecuteWorkflow(ctx, client.StartWorkflowOptions{TaskQueue: callerTaskQueue}, wf, in, timeout)
+		require.NoError(t, err)
+		return r.Get(ctx, nil)
+	}
+
+	// Both forms of operation, activity-backed and workflow-backed, stop retrying before the
+	// caller's timeout, so the caller gets the connector's error rather than its own timeout.
+	for _, tc := range []struct {
+		name string
+		wf   any
+		in   any
+	}{
+		{"getWeatherByZip", callGetWeatherByZipWithin, weatherapi.GetWeatherByZipInput{Zip: "50399"}},
+		{"weatherForZips", callWeatherForZipsWithin, weatherapi.WeatherForZipsInput{Zips: []string{"94105", "50399"}}},
+	} {
+		t.Run(tc.name+" stops retrying before the caller's timeout", func(t *testing.T) {
+			start := time.Now()
+			err := runWithin(t, tc.wf, tc.in, shortCallerTimeout)
+			var appErr *temporal.ApplicationError
+			require.ErrorAs(t, err, &appErr)
+			require.Equal(t, httpconnector.ErrorTypeTransient, appErr.Type())
+			require.Less(t, time.Since(start), shortCallerTimeout)
+		})
+
+		t.Run(tc.name+" refuses a caller timeout too short for one request", func(t *testing.T) {
+			before := len(weatherAPI.requests())
+			err := runWithin(t, tc.wf, tc.in, 15*time.Second)
+			var handlerErr *nexus.HandlerError
+			require.ErrorAs(t, err, &handlerErr)
+			require.Equal(t, nexus.HandlerErrorTypeBadRequest, handlerErr.Type)
+			var appErr *temporal.ApplicationError
+			require.ErrorAs(t, err, &appErr)
+			require.Equal(t, httpconnector.ErrorTypeInvalidRequest, appErr.Type())
+			require.Contains(t, appErr.Message(), "which leaves no time for an attempt")
+			require.Len(t, weatherAPI.requests(), before, "nothing was sent")
+		})
 	}
 
 	t.Run("getWeatherByZip sends the request the spec describes", func(t *testing.T) {

@@ -22,7 +22,7 @@ func TestRequest(t *testing.T) {
 		HasBody: true,
 	}
 	c := New(API{BaseURL: "https://api.example.com/v1/", APIKeyParam: "key"},
-		Config{APIKeyEnvVar: "HTTP_CONNECTOR_SECRET_X", ScheduleToCloseSeconds: 60}, nil)
+		Config{APIKeyEnvVar: "HTTP_CONNECTOR_SECRET_X"}, nil)
 
 	req, err := c.Request(op, map[string]any{
 		"id":     "a/b c",
@@ -44,16 +44,15 @@ func TestRequest(t *testing.T) {
 	require.JSONEq(t, `{"name":"n"}`, *req.Body)
 	require.Equal(t, "HTTP_CONNECTOR_SECRET_X", *req.APIKeyEnvVar)
 	require.Equal(t, "key", *req.APIKeyParam)
-	require.Equal(t, int64(60), *req.ScheduleToCloseSeconds)
 }
 
 func TestPollingActivityOptions(t *testing.T) {
-	c := New(API{BaseURL: "https://api.example.com"}, Config{ScheduleToCloseSeconds: 3600}, nil)
-	opts := c.PollingActivityOptions("id", 5*time.Second)
+	c := New(API{BaseURL: "https://api.example.com"}, Config{}, nil)
+	opts := c.PollingActivityOptions("id", 5*time.Second, time.Hour)
 	require.Equal(t, time.Hour, opts.ScheduleToCloseTimeout)
 	require.Equal(t, time.Hour, opts.StartToCloseTimeout, "one attempt can poll for the whole operation")
 	require.Equal(t, 65*time.Second, opts.HeartbeatTimeout, "the poll interval plus one request")
-	require.Equal(t, c.ActivityOptions("id").RetryPolicy, opts.RetryPolicy)
+	require.Equal(t, c.ActivityOptions("id", time.Hour).RetryPolicy, opts.RetryPolicy)
 }
 
 func TestRequestLeavesOutUnsetParams(t *testing.T) {

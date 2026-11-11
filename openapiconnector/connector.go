@@ -68,9 +68,11 @@ type Config struct {
 	// APIKeyEnvVar names the environment variable on the worker that holds the API key. It must
 	// start with httpconnector.SecretEnvPrefix. Empty means the API takes no key.
 	APIKeyEnvVar string
-	// ScheduleToCloseSeconds bounds each operation, including every retry. Zero means the HTTP
-	// connector's default, 25 hours. A caller's Nexus operation timeout must be longer.
-	ScheduleToCloseSeconds int64
+	// MaxDurationSeconds caps how long each operation may take, including every retry, below the
+	// HTTP connector's own maximum (httpconnector.MaxDurationEnvVar, 25 hours by default). Zero
+	// means only that maximum. Within it, an operation ends shortly before the caller's Nexus
+	// operation times out (see ScheduleToClose).
+	MaxDurationSeconds int64
 }
 
 // Connector runs one API's operations.
@@ -144,9 +146,6 @@ func (c *Connector) Request(op Operation, in any) (httpapi.SendRequestInput, err
 			req.APIKeyParam = new(c.api.APIKeyParam)
 		}
 	}
-	if c.cfg.ScheduleToCloseSeconds > 0 {
-		req.ScheduleToCloseSeconds = new(c.cfg.ScheduleToCloseSeconds)
-	}
 	return req, nil
 }
 
@@ -195,15 +194,38 @@ func Call[O any](ctx context.Context, c *Connector, op Operation, in any) (*O, e
 	return out, nil
 }
 
-// ActivityOptions are the options for an activity of this API with the given ID: the HTTP
-// connector's retry policy and timeouts, bounded by Config.ScheduleToCloseSeconds.
-func (c *Connector) ActivityOptions(id string) client.StartActivityOptions {
-	return httpconnector.ActivityOptions(id, c.timeouts())
+// ScheduleToClose is how long an operation of this API may take in all, including every retry:
+// the HTTP connector's ScheduleToClose for operationTimeout, the operation-timeout header (empty
+// for none), capped by Config.MaxDurationSeconds. It ends shortly before the caller's operation
+// times out, and reports an error if that leaves no time for one request.
+func (c *Connector) ScheduleToClose(operationTimeout string) (time.Duration, error) {
+	total, err := c.http.ScheduleToClose(httpapi.SendRequestInput{}, operationTimeout)
+	if err != nil {
+		return 0, err
+	}
+	return min(total, c.MaxDuration()), nil
 }
 
-// WorkflowActivityOptions are ActivityOptions for running this API's activities from a workflow.
-func (c *Connector) WorkflowActivityOptions() workflow.ActivityOptions {
-	opts := c.ActivityOptions("")
+// MaxDuration is the longest an operation of this API may take in all: the HTTP connector's
+// maximum, capped by Config.MaxDurationSeconds.
+func (c *Connector) MaxDuration() time.Duration {
+	if c.cfg.MaxDurationSeconds > 0 {
+		return min(c.http.MaxDuration(), time.Duration(c.cfg.MaxDurationSeconds)*time.Second)
+	}
+	return c.http.MaxDuration()
+}
+
+// ActivityOptions are the options for an activity of this API with the given ID: the HTTP
+// connector's retry policy and timeouts, with scheduleToClose (from ScheduleToClose) bounding
+// the whole operation.
+func (c *Connector) ActivityOptions(id string, scheduleToClose time.Duration) client.StartActivityOptions {
+	return httpconnector.ActivityOptions(id, scheduleToClose)
+}
+
+// WorkflowActivityOptions are ActivityOptions for running this API's activities from a workflow,
+// each bounded by scheduleToClose.
+func (c *Connector) WorkflowActivityOptions(scheduleToClose time.Duration) workflow.ActivityOptions {
+	opts := c.ActivityOptions("", scheduleToClose)
 	return workflow.ActivityOptions{
 		StartToCloseTimeout:    opts.StartToCloseTimeout,
 		ScheduleToCloseTimeout: opts.ScheduleToCloseTimeout,
@@ -213,12 +235,12 @@ func (c *Connector) WorkflowActivityOptions() workflow.ActivityOptions {
 
 // PollingActivityOptions are the options for an activity that polls in a loop within one
 // attempt, with the given ID. The attempt may last as long as the whole operation
-// (Config.ScheduleToCloseSeconds) instead of one request's 60 seconds. A HeartbeatTimeout of
+// (scheduleToClose, from ScheduleToClose) instead of one request's 60 seconds. A HeartbeatTimeout of
 // pollInterval plus one request's 60 seconds, the longest gap between WaitToPoll's heartbeats,
 // notices a worker that died; the attempt is then retried. Errors retry as for any of this API's
 // activities.
-func (c *Connector) PollingActivityOptions(id string, pollInterval time.Duration) client.StartActivityOptions {
-	opts := c.ActivityOptions(id)
+func (c *Connector) PollingActivityOptions(id string, pollInterval, scheduleToClose time.Duration) client.StartActivityOptions {
+	opts := c.ActivityOptions(id, scheduleToClose)
 	opts.HeartbeatTimeout = pollInterval + opts.StartToCloseTimeout
 	opts.StartToCloseTimeout = opts.ScheduleToCloseTimeout
 	return opts
@@ -242,18 +264,9 @@ func WaitToPoll(ctx context.Context, interval time.Duration) error {
 	}
 }
 
-// timeouts is a request that carries only this API's timeouts.
-func (c *Connector) timeouts() httpapi.SendRequestInput {
-	var req httpapi.SendRequestInput
-	if c.cfg.ScheduleToCloseSeconds > 0 {
-		req.ScheduleToCloseSeconds = new(c.cfg.ScheduleToCloseSeconds)
-	}
-	return req
-}
-
 // ActivityOperation is the Nexus operation for op, backed by the standalone activity act. It
-// rejects a request that can't be made, or that would outlast the caller's operation timeout,
-// with a BadRequest handler error, without starting the activity.
+// rejects a request that can't be made, or whose caller's operation has too little time left
+// (see ScheduleToClose), with a BadRequest handler error, without starting the activity.
 func ActivityOperation[I, O any](c *Connector, op Operation, act func(context.Context, I) (O, error)) nexus.RegisterableOperation {
 	validate := func(in I) error {
 		req, err := c.Request(op, in)
@@ -269,8 +282,8 @@ func ActivityOperation[I, O any](c *Connector, op Operation, act func(context.Co
 // by hand that makes several of this API's calls, polling in a loop within one attempt (see
 // PollingActivityOptions and WaitToPoll).
 func PollingOperation[I, O any](c *Connector, name string, pollInterval time.Duration, act func(context.Context, I) (O, error)) nexus.RegisterableOperation {
-	return activityOperation(c, name, act, func(I) error { return nil }, func(id string) client.StartActivityOptions {
-		return c.PollingActivityOptions(id, pollInterval)
+	return activityOperation(c, name, act, func(I) error { return nil }, func(id string, scheduleToClose time.Duration) client.StartActivityOptions {
+		return c.PollingActivityOptions(id, pollInterval, scheduleToClose)
 	})
 }
 
@@ -279,7 +292,7 @@ func activityOperation[I, O any](
 	name string,
 	act func(context.Context, I) (O, error),
 	validate func(I) error,
-	options func(id string) client.StartActivityOptions,
+	options func(id string, scheduleToClose time.Duration) client.StartActivityOptions,
 ) nexus.RegisterableOperation {
 	return temporalnexus.MustNewTemporalOperation(temporalnexus.TemporalOperationOptions[I, O]{
 		Name: name,
@@ -290,8 +303,9 @@ func activityOperation[I, O any](
 			opts temporalnexus.StartTemporalOperationOptions,
 		) (temporalnexus.TemporalOperationResult[O], error) {
 			err := validate(in)
+			var total time.Duration
 			if err == nil {
-				err = httpconnector.CheckCallerTimeout(c.timeouts(), opts.Header.Get(nexus.HeaderOperationTimeout))
+				total, err = c.ScheduleToClose(opts.Header.Get(nexus.HeaderOperationTimeout))
 			}
 			if err != nil {
 				return temporalnexus.TemporalOperationResult[O]{}, &nexus.HandlerError{
@@ -300,7 +314,7 @@ func activityOperation[I, O any](
 				}
 			}
 			// The ID comes from the Nexus request ID, so a retried start reaches the same activity.
-			return temporalnexus.StartActivity(ctx, nc, options(name+"-"+opts.RequestID), act, in)
+			return temporalnexus.StartActivity(ctx, nc, options(name+"-"+opts.RequestID, total), act, in)
 		},
 	})
 }
